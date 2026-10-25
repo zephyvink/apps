@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tj-cache-v8';
+const CACHE_NAME = 'tj-cache-v9';
 const FILES_TO_CACHE = [
   './index.html',
   './manifest.json',

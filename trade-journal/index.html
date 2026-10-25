@@ -458,12 +458,73 @@ function migrateDB(raw) {
   if (!activeAccountId || !accounts[activeAccountId]) activeAccountId = Object.keys(accounts)[0];
   return { activeAccountId, accounts };
 }
-function loadDB() {
-  let raw = null;
-  try { raw = JSON.parse(localStorage.getItem(DB_KEY)); } catch {}
-  return migrateDB(raw);
+const IDB_NAME = 'trade_journal_db', IDB_STORE = 'kv', IDB_KEY = 'db';
+const SAVE_ERR_MODAL = "Couldn't save \u2014 this device's storage looks full. Nothing was changed.";
+const SAVE_ERR_BG = "Your last change didn't save \u2014 device storage may be full. Export a backup in Settings.";
+let idbOk = true, idbPromise = null;
+function openIdb() {
+  if (!idbPromise) {
+    idbPromise = new Promise((resolve, reject) => {
+      try {
+        const r = indexedDB.open(IDB_NAME, 1);
+        r.onupgradeneeded = () => r.result.createObjectStore(IDB_STORE);
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+        r.onblocked = () => reject(new Error('blocked'));
+      } catch (e) { reject(e); }
+    });
+  }
+  return idbPromise;
 }
-function saveDB(db) { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
+async function idbGet() {
+  const d = await openIdb();
+  return new Promise((resolve, reject) => {
+    const q = d.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(IDB_KEY);
+    q.onsuccess = () => resolve(q.result);
+    q.onerror = () => reject(q.error);
+  });
+}
+async function idbPut(value) {
+  const d = await openIdb();
+  return new Promise((resolve, reject) => {
+    const t = d.transaction(IDB_STORE, 'readwrite');
+    t.objectStore(IDB_STORE).put(value, IDB_KEY);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error || new Error('aborted'));
+  });
+}
+async function loadDBAsync() {
+  let raw = null, fromLocal = false;
+  try { raw = await idbGet(); } catch (e) { idbOk = false; }
+  if (!raw) {
+    try { const s = localStorage.getItem(DB_KEY); if (s) { raw = JSON.parse(s); fromLocal = true; } } catch {}
+  }
+  const db = migrateDB(raw);
+  if (fromLocal && idbOk) {
+    try { await idbPut(db); localStorage.removeItem(DB_KEY); } catch (e) {}
+  }
+  return db;
+}
+let saveActive = false, saveQueued = null, saveWaiters = [];
+function saveDB(db) {
+  return new Promise((resolve, reject) => {
+    saveQueued = db; saveWaiters.push({ resolve, reject });
+    if (!saveActive) pumpSaves();
+  });
+}
+async function pumpSaves() {
+  saveActive = true;
+  while (saveQueued) {
+    const db = saveQueued, waiters = saveWaiters;
+    saveQueued = null; saveWaiters = [];
+    try {
+      if (idbOk) await idbPut(db); else localStorage.setItem(DB_KEY, JSON.stringify(db));
+      waiters.forEach((w) => w.resolve());
+    } catch (e) { waiters.forEach((w) => w.reject(e)); }
+  }
+  saveActive = false;
+}
 
 function resizeImage(file, maxWidth, quality) {
   return new Promise((resolve, reject) => {
@@ -536,7 +597,7 @@ function priorBalance(trades, beforeDate, excludeId) {
     .forEach((t) => { if (t.date <= beforeDate) result = t.balance; });
   return result;
 }
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.8.1';
 const RANGE_OPTIONS = [['all', 'ALL'], ['day', 'DAY'], ['week', 'WEEK'], ['month', 'MONTH'], ['quarter', 'QTR'], ['year', 'YEAR']];
 const RANGE_NAMES = { all: 'All time', day: 'Today', week: 'This week', month: 'This month', quarter: 'This quarter', year: 'This year' };
 const RANGE_STORE_KEY = 'trade_journal_pnl_range';
@@ -653,8 +714,8 @@ function equityDataFor(trades) {
   return { balanceSeries, rSeries };
 }
 
-function App() {
-  const [db, setDb] = useState(loadDB());
+function App({ initialDb }) {
+  const [db, setDb] = useState(initialDb);
   const [cursor, setCursor] = useState(() => { const d = new Date(); return { y: d.getFullYear(), m: d.getMonth() }; });
   const [selectedDay, setSelectedDay] = useState(todayKey());
   const [detail, setDetail] = useState(null);
@@ -668,22 +729,30 @@ function App() {
   const [pnlAnchor, setPnlAnchor] = useState(todayKey());
   const importRef = useRef(null);
 
-  useEffect(() => { saveDB(db); }, []);
 
   const account = db.accounts[db.activeAccountId];
   const trades = Object.values(account.trades);
 
-  function persist(newDb) { setDb(newDb); saveDB(newDb); }
-  function addTrade(payload) {
+  function persist(newDb) {
+    setDb(newDb);
+    saveDB(newDb).then(() => setError((e) => (e === SAVE_ERR_BG ? '' : e))).catch(() => setError(SAVE_ERR_BG));
+  }
+  async function commit(newDb) {
+    try { await saveDB(newDb); setDb(newDb); setError((e) => (e === SAVE_ERR_BG ? '' : e)); return null; }
+    catch (e) { return SAVE_ERR_MODAL; }
+  }
+  async function addTrade(payload) {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const newAcc = { ...account, trades: { ...account.trades, [id]: { id, ...payload } } };
-    persist({ ...db, accounts: { ...db.accounts, [account.id]: newAcc } });
-    setFormOpen(null);
+    const err = await commit({ ...db, accounts: { ...db.accounts, [account.id]: newAcc } });
+    if (!err) setFormOpen(null);
+    return err;
   }
-  function updateTrade(id, payload) {
+  async function updateTrade(id, payload) {
     const newAcc = { ...account, trades: { ...account.trades, [id]: { id, ...payload } } };
-    persist({ ...db, accounts: { ...db.accounts, [account.id]: newAcc } });
-    setFormOpen(null);
+    const err = await commit({ ...db, accounts: { ...db.accounts, [account.id]: newAcc } });
+    if (!err) setFormOpen(null);
+    return err;
   }
   function deleteTrade(id) {
     const t = { ...account.trades }; delete t[id];
@@ -910,7 +979,7 @@ function App() {
           account={account}
           editTrade={formOpen === 'new' ? null : formOpen}
           onClose={() => setFormOpen(null)}
-          onSave={(payload) => { if (formOpen === 'new') addTrade(payload); else updateTrade(formOpen.id, payload); }}
+          onSave={(payload) => (formOpen === 'new' ? addTrade(payload) : updateTrade(formOpen.id, payload))}
         />
       )}
       {detail && <DetailModal trade={detail} onClose={() => setDetail(null)} onDelete={deleteTrade} onEdit={() => { setFormOpen(detail); setDetail(null); }} />}
@@ -966,6 +1035,8 @@ function AddModal({ defaultDate, account, editTrade, onClose, onSave }) {
   const [notes, setNotes] = useState(editTrade ? (editTrade.notes || '') : '');
   const [images, setImages] = useState(editTrade ? tradeImages(editTrade) : []);
   const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState('');
   const fileRef = useRef(null);
 
   const knownInstruments = Object.keys((account.costs && account.costs.perInstrument) || {});
@@ -995,15 +1066,16 @@ function AddModal({ defaultDate, account, editTrade, onClose, onSave }) {
   const priorBal = priorBalance(Object.values(account.trades), date, excludeId);
   const autoBalance = (typeof liveNet === 'number' && priorBal !== null) ? priorBal + liveNet : null;
 
-  function save() {
-    if (busy) return;
+  async function save() {
+    if (busy || saving) return;
     let commission = 0, spread = 0, netPnl = rawPnl;
     if (typeof rawPnl === 'number') {
       commission = computeCommission(resolvedCosts, riskAmt, lotSize, units);
       spread = computeSpread(resolvedCosts, lotSize);
       netPnl = rawPnl - commission - spread + swapVal;
     }
-    onSave({
+    setSaving(true); setSaveErr('');
+    const err = await onSave({
       date, notes, images,
       instrument: instrument.trim(),
       lotSize: lotSize === '' ? null : parseFloat(lotSize),
@@ -1013,6 +1085,7 @@ function AddModal({ defaultDate, account, editTrade, onClose, onSave }) {
       balance: balance === '' ? autoBalance : parseFloat(balance),
       riskAmount: riskAmt,
     });
+    if (err) { setSaving(false); setSaveErr(err); }
   }
 
   return (
@@ -1105,7 +1178,8 @@ function AddModal({ defaultDate, account, editTrade, onClose, onSave }) {
           {busy ? <Loader size={16} /> : <ImagePlus size={16} />}{busy ? 'Processing…' : 'Add screenshots'}
         </button>
 
-        <button onClick={save} disabled={busy} className="press w-full py-2.5 text-sm font-medium" style={{ background: GREEN, color: '#0A0A0B', borderRadius: R.md }}>{editTrade ? 'Save changes' : 'Save entry'}</button>
+        {saveErr && <p style={{ color: RED }} className="text-xs mb-3 leading-relaxed">{saveErr}</p>}
+        <button onClick={save} disabled={busy || saving} className="press w-full py-2.5 text-sm font-medium" style={{ background: GREEN, color: '#0A0A0B', borderRadius: R.md, opacity: saving ? 0.6 : 1 }}>{saving ? 'Saving\u2026' : (editTrade ? 'Save changes' : 'Save entry')}</button>
       </div>
     </div>
   );
@@ -1494,7 +1568,9 @@ function SettingsTab({ account, onRenameAccount, onSetDefaultCosts, onSetOverrid
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+loadDBAsync().then((initialDb) => {
+  ReactDOM.createRoot(document.getElementById('root')).render(<App initialDb={initialDb} />);
+});
 </script>
 <script>
 (function () {
